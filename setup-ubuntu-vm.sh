@@ -33,6 +33,11 @@ PROXY_PASS="${PROXY_PASS:-}"
 NO_PROXY_LIST="${NO_PROXY_LIST:-localhost,127.0.0.1,::1,.local}"
 SKIP_PROXY="${SKIP_PROXY:-0}"
 ASSUME_YES="${ASSUME_YES:-0}"
+# VARIANT: "desktop" | "server" | "" (= autodetect)
+VARIANT="${VARIANT:-}"
+
+# Unterstützte Ubuntu-Versionen (informativ – läuft auch auf anderen)
+SUPPORTED_UBUNTU_VERSIONS=("22.04" "24.04" "26.04")
 
 # ---------------------------------------------------------------------------
 # Hilfsfunktionen
@@ -46,7 +51,10 @@ err()  { echo -e "${RED}[FAIL]${NC}  $*" | tee -a "$LOG_FILE" >&2; }
 
 usage() {
   cat <<EOF
-$SCRIPT_NAME – Ubuntu-24.04-VM Erstbereitstellung hinter Proxy
+$SCRIPT_NAME – Ubuntu-VM Erstbereitstellung hinter Proxy
+
+Unterstützte Varianten:  Desktop und Server (Autodetect via systemd-Default)
+Getestet mit:            Ubuntu 22.04 / 24.04 / 26.04 LTS
 
 Optionen:
   --host <proxy>       Proxy-Hostname oder IP (z. B. proxy.example.com)
@@ -56,12 +64,15 @@ Optionen:
   --no-proxy <liste>   Komma-Liste der NO_PROXY-Einträge
                        Default: $NO_PROXY_LIST
   --skip-proxy         Proxy-Konfiguration überspringen (direkte Verbindung)
+  --server             Als Server behandeln (kein open-vm-tools-desktop)
+  --desktop            Als Desktop behandeln (mit open-vm-tools-desktop)
+                       (ohne --server/--desktop wird automatisch erkannt)
   -y, --yes            Alle Rückfragen mit Ja beantworten
   -h, --help           Diese Hilfe anzeigen
 
 Umgebungsvariablen:
   PROXY_HOST, PROXY_PORT, PROXY_USER, PROXY_PASS,
-  NO_PROXY_LIST, SKIP_PROXY, ASSUME_YES
+  NO_PROXY_LIST, SKIP_PROXY, ASSUME_YES, VARIANT
 EOF
 }
 
@@ -108,6 +119,8 @@ parse_args() {
       --pass)       PROXY_PASS="$2"; shift 2 ;;
       --no-proxy)   NO_PROXY_LIST="$2"; shift 2 ;;
       --skip-proxy) SKIP_PROXY=1; shift ;;
+      --server)     VARIANT="server"; shift ;;
+      --desktop)    VARIANT="desktop"; shift ;;
       -y|--yes)     ASSUME_YES=1; shift ;;
       -h|--help)    usage; exit 0 ;;
       *)            err "Unbekannte Option: $1"; usage; exit 2 ;;
@@ -283,6 +296,39 @@ configure_proxy() {
 }
 
 # ---------------------------------------------------------------------------
+# Variant-Detection (Desktop vs. Server)
+# ---------------------------------------------------------------------------
+detect_variant() {
+  # Bereits explizit über Flag/ENV gesetzt?
+  if [[ -n "$VARIANT" ]]; then
+    if [[ "$VARIANT" != "desktop" && "$VARIANT" != "server" ]]; then
+      err "Ungültige VARIANT: $VARIANT (erwarte 'desktop' oder 'server')"
+      exit 2
+    fi
+    log "Variant manuell vorgegeben: $VARIANT"
+    return 0
+  fi
+
+  # Primär: systemd-Default-Target
+  local default_target
+  default_target="$(systemctl get-default 2>/dev/null || true)"
+
+  # Sekundär: Desktop-Metapaket installiert?
+  local has_desktop_pkg=0
+  if dpkg-query -W -f='${Status}' ubuntu-desktop         2>/dev/null | grep -q "ok installed" \
+  || dpkg-query -W -f='${Status}' ubuntu-desktop-minimal 2>/dev/null | grep -q "ok installed"; then
+    has_desktop_pkg=1
+  fi
+
+  if [[ "$default_target" == "graphical.target" || "$has_desktop_pkg" -eq 1 ]]; then
+    VARIANT="desktop"
+  else
+    VARIANT="server"
+  fi
+  log "Erkannte Variante: $VARIANT  (systemd default: ${default_target:-unbekannt}, desktop-paket: $has_desktop_pkg)"
+}
+
+# ---------------------------------------------------------------------------
 # Paket-Installation
 # ---------------------------------------------------------------------------
 apt_update() {
@@ -295,16 +341,25 @@ apt_update() {
 }
 
 install_packages() {
-  log "=== Pakete installieren ==="
+  log "=== Pakete installieren (Variante: $VARIANT) ==="
   export DEBIAN_FRONTEND=noninteractive
-  apt-get install -y --no-install-recommends \
-    open-vm-tools \
-    open-vm-tools-desktop \
-    openssh-server \
-    ca-certificates \
-    curl \
-    wget \
+
+  local pkgs=(
+    open-vm-tools
+    openssh-server
+    ca-certificates
+    curl
+    wget
     net-tools
+  )
+  if [[ "$VARIANT" == "desktop" ]]; then
+    # Bringt die GUI-Integration (Copy/Paste, Drag&Drop, Display-Resize)
+    pkgs+=(open-vm-tools-desktop)
+  else
+    log "Server-Variante: open-vm-tools-desktop wird nicht installiert."
+  fi
+
+  apt-get install -y --no-install-recommends "${pkgs[@]}"
   ok "Pakete installiert."
 }
 
@@ -434,12 +489,21 @@ main() {
   if [[ -r /etc/os-release ]]; then
     # shellcheck disable=SC1091
     . /etc/os-release
-    log "Erkannt: $PRETTY_NAME"
+    log "Erkannt: $PRETTY_NAME (ID=${ID:-?} VERSION_ID=${VERSION_ID:-?})"
     if [[ "${ID:-}" != "ubuntu" ]]; then
       warn "Dieses Script wurde für Ubuntu geschrieben – fahre trotzdem fort."
+    else
+      local supported=0 v
+      for v in "${SUPPORTED_UBUNTU_VERSIONS[@]}"; do
+        [[ "${VERSION_ID:-}" == "$v" ]] && supported=1 && break
+      done
+      if [[ $supported -eq 0 ]]; then
+        warn "Ubuntu ${VERSION_ID:-?} ist nicht explizit getestet – getestet: ${SUPPORTED_UBUNTU_VERSIONS[*]}."
+      fi
     fi
   fi
 
+  detect_variant
   collect_proxy_details
   configure_proxy
   apt_update
